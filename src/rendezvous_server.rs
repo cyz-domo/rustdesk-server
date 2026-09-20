@@ -903,6 +903,9 @@ impl RendezvousServer {
             socket_addr: la.local_addr.clone(),
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
+            // B echoes its own IPv6 punch socket here (handle_intranet's start_ipv6);
+            // A only runs its IPv6 leg when this field carries a port.
+            socket_addr_v6: la.socket_addr_v6,
             ..Default::default()
         };
         p.set_is_local(true);
@@ -1018,6 +1021,10 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    // Same forwarding as PunchHole: without it B's handle_intranet sees
+                    // peer_addr_v6.port()==0 and never spawns the IPv6 leg, so a
+                    // same_intranet (mis)judgment silently forfeits IPv6 direct.
+                    socket_addr_v6,
                     ..Default::default()
                 });
             } else {
