@@ -449,6 +449,24 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     self.handle_local_addr(la, addr, Some(socket)).await?;
                 }
+                Some(rendezvous_message::Union::TestNatRequest(tar)) => {
+                    // Answer UDP TestNat with the observed source port so clients learn their
+                    // UDP mapping; without this PunchHoleRequest.udp_port stays 0 and the
+                    // UDP punch path never runs.
+                    let mut msg_out = RendezvousMessage::new();
+                    let mut res = TestNatResponse {
+                        port: addr.port() as _,
+                        ..Default::default()
+                    };
+                    if self.inner.serial > tar.serial {
+                        let mut cu = ConfigUpdate::new();
+                        cu.serial = self.inner.serial;
+                        cu.rendezvous_servers = (*self.rendezvous_servers).clone();
+                        res.cu = MessageField::from_option(Some(cu));
+                    }
+                    msg_out.set_test_nat_response(res);
+                    socket.send(&msg_out, addr).await?;
+                }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
                     if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
                         let mut inner: Inner = (*self.inner).clone();
@@ -835,6 +853,8 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            // B arrived via UDP => `addr` is B's UDP mapping; A must switch to its UDP socket.
+            is_udp: socket.is_some(),
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -842,7 +862,11 @@ impl RendezvousServer {
         }
         msg_out.set_punch_hole_response(p);
         if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
+            // A's request may have come over either channel: reply via UDP to its observed
+            // address, and also hand the response to A's TCP punch connection (UDP-only
+            // delivery is a dead letter when A requested over TCP).
+            allow_err!(socket.send(&msg_out, addr_a).await);
+            self.send_to_tcp(msg_out, addr_a).await;
         } else {
             self.send_to_tcp(msg_out, addr_a).await;
         }
@@ -983,6 +1007,8 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    // forward A's observed UDP port so B can probe it and take the UDP punch path
+                    udp_port: ph.udp_port,
                     ..Default::default()
                 });
             }
