@@ -1,13 +1,12 @@
 name: Docker Hub - patched all-in-one image
 
 # What this produces
-#   <DOCKER_IMAGE>:<prefix>            multi-arch manifest
-#   <DOCKER_IMAGE>:<prefix>-amd64      single arch
-#   <DOCKER_IMAGE>:<prefix>-arm64v8    single arch
+#   <DOCKER_IMAGE>:<prefix>-amd64 / -arm64v8     single arch
+#   <DOCKER_IMAGE>:<prefix>                       multi-arch manifest
 #
-# The image is the all-in-one stack the docker/ context already describes:
+# The image is the all-in-one stack docker/Dockerfile already describes:
 # hbbs + hbbr + key-secret + the rustdesk-api web console under s6-overlay.
-# hbbs here is built from this repository, so it carries the UDP hole-punching
+# hbbs here is compiled from this repository, so it carries the UDP hole-punching
 # and IPv6 (socket_addr_v6) fixes that the published images lack.
 #
 # Required repository secrets:
@@ -34,10 +33,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  meta:
+    name: Compute tags
+    runs-on: ubuntu-24.04
+    outputs:
+      prefix: ${{ steps.vars.outputs.PREFIX }}
+      ver: ${{ steps.vars.outputs.VER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive prefix and version
+        id: vars
+        run: |
+          PREFIX="${{ github.event.inputs.TAG_PREFIX || 'dualstack' }}"
+          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "PREFIX=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "VER=$VER" >> "$GITHUB_OUTPUT"
+          echo "tags: $PREFIX, $PREFIX-$VER"
+
   # Musl binaries built inside rust:1-alpine: same libc as the runtime image,
   # and each arch builds on a native runner, so no QEMU and no cross toolchain.
   build:
     name: Build binaries - ${{ matrix.job.name }}
+    needs: meta
     runs-on: ${{ matrix.job.runner }}
     strategy:
       fail-fast: false
@@ -58,6 +77,7 @@ jobs:
             rust:1-alpine sh -eu -c '
               apk add --no-cache git build-base linux-headers pkgconf openssl-dev cmake ca-certificates
               git config --global --add safe.directory /io
+              rustc --version
               cargo build --release
               chmod -R a+rX target
             '
@@ -65,10 +85,9 @@ jobs:
       - name: Collect binaries
         run: |
           mkdir -p dist
-          BIN="target/release"
-          cp "$BIN/hbbs" "$BIN/hbbr" "$BIN/rustdesk-utils" dist/
+          cp target/release/hbbs target/release/hbbr target/release/rustdesk-utils dist/
           ls -la dist
-          sha256sum dist/*
+          md5sum dist/*
 
       - name: Publish artifact
         uses: actions/upload-artifact@v4
@@ -84,14 +103,14 @@ jobs:
   # + s6-overlay + rootfs (our binaries land in rootfs/usr/bin).
   docker:
     name: Docker push - ${{ matrix.job.name }}
-    needs: build
+    needs: [meta, build]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         job:
-          - { name: "amd64",   docker_platform: "linux/amd64",  s6_platform: "x86_64" }
-          - { name: "arm64v8", docker_platform: "linux/arm64",  s6_platform: "aarch64" }
+          - { name: "amd64",   docker_platform: "linux/amd64", s6_platform: "x86_64" }
+          - { name: "arm64v8", docker_platform: "linux/arm64", s6_platform: "aarch64" }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -104,14 +123,6 @@ jobs:
 
       - name: Make binaries executable
         run: chmod -v a+x docker/rootfs/usr/bin/*
-
-      - name: Compute tags
-        id: vars
-        run: |
-          PREFIX="${{ github.event.inputs.TAG_PREFIX || 'dualstack' }}"
-          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          echo "PREFIX=$PREFIX" >> $GITHUB_ENV
-          echo "VER=$VER" >> $GITHUB_ENV
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -135,45 +146,35 @@ jobs:
           build-args: |
             S6_ARCH=${{ matrix.job.s6_platform }}
           tags: |
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-${{ matrix.job.name }}
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-${{ env.VER }}-${{ matrix.job.name }}
+            ${{ secrets.DOCKER_IMAGE }}:${{ needs.meta.outputs.prefix }}-${{ matrix.job.name }}
+            ${{ secrets.DOCKER_IMAGE }}:${{ needs.meta.outputs.prefix }}-${{ needs.meta.outputs.ver }}-${{ matrix.job.name }}
 
   manifest:
     name: Docker manifest
-    needs: docker
+    needs: [meta, docker]
     runs-on: ubuntu-24.04
+    env:
+      IMAGE: ${{ secrets.DOCKER_IMAGE }}
+      PREFIX: ${{ needs.meta.outputs.prefix }}
+      VER: ${{ needs.meta.outputs.ver }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Compute tags
-        id: vars
-        run: |
-          PREFIX="${{ github.event.inputs.TAG_PREFIX || 'dualstack' }}"
-          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          echo "PREFIX=$PREFIX" >> $GITHUB_ENV
-          echo "VER=$VER" >> $GITHUB_ENV
-
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Create and push manifest (${{ env.PREFIX }})
-        uses: Noelware/docker-manifest-action@v0.2.3
-        with:
-          tags: ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}
-          inputs: |
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-amd64,
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-arm64v8
-          push: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Create and push manifest (${{ env.PREFIX }}-${{ env.VER }})
-        uses: Noelware/docker-manifest-action@v0.2.3
-        with:
-          tags: ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-${{ env.VER }}
-          inputs: |
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-${{ env.VER }}-amd64,
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-${{ env.VER }}-arm64v8
-          push: true
+      - name: Create and push manifest ($PREFIX-$VER)
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:$PREFIX-$VER" \
+            "$IMAGE:$PREFIX-$VER-amd64" "$IMAGE:$PREFIX-$VER-arm64v8"
+
+      - name: Create and push manifest ($PREFIX)
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:$PREFIX" \
+            "$IMAGE:$PREFIX-amd64" "$IMAGE:$PREFIX-arm64v8"
