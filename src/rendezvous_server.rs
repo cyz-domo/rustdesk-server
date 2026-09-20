@@ -855,6 +855,16 @@ impl RendezvousServer {
             relay_server: phs.relay_server.clone(),
             // B arrived via UDP => `addr` is B's UDP mapping; A must switch to its UDP socket.
             is_udp: socket.is_some(),
+            // A's IPv6 leg is gated on this dedicated field: carry B's own public v6
+            // (start_ipv6 returns it in PunchHoleSent.socket_addr_v6), else fall back to
+            // B's observed address when it reached us over IPv6.
+            socket_addr_v6: if !phs.socket_addr_v6.is_empty() {
+                phs.socket_addr_v6.clone()
+            } else if addr.is_ipv6() {
+                AddrMangle::encode(addr).into()
+            } else {
+                Default::default()
+            },
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -983,7 +993,21 @@ impl RendezvousServer {
                         _ => false,
                     }
                 });
-            let socket_addr = AddrMangle::encode(addr).into();
+            let socket_addr: Bytes = AddrMangle::encode(addr).into();
+            // The client only runs the IPv6 leg when the dedicated socket_addr_v6 field carries
+            // a port, and it dials exactly that port — so it has to be A's own IPv6 UDP punch
+            // socket, which A self-reports in PunchHoleRequest.socket_addr_v6. The TCP source
+            // port we observed A on (encoded in `socket_addr`) is a port nothing listens on for
+            // UDP, so dialing it could never land. Open-source hbbs never filled the field, so
+            // IPv6 introduction was Pro-server-only; forward A's self-report, falling back to the
+            // observed v6 address only when A reached us over v6 but reported no socket.
+            let socket_addr_v6 = if !ph.socket_addr_v6.is_empty() {
+                ph.socket_addr_v6
+            } else if addr.is_ipv6() {
+                socket_addr.clone()
+            } else {
+                Default::default()
+            };
             if same_intranet {
                 log::debug!(
                     "Fetch local addr {:?} {:?} request from {:?}",
@@ -1005,6 +1029,7 @@ impl RendezvousServer {
                 );
                 msg_out.set_punch_hole(PunchHole {
                     socket_addr,
+                    socket_addr_v6,
                     nat_type: ph.nat_type,
                     relay_server,
                     // forward A's observed UDP port so B can probe it and take the UDP punch path
