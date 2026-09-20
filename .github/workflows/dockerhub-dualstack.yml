@@ -1,0 +1,179 @@
+name: Docker Hub - patched all-in-one image
+
+# What this produces
+#   <DOCKER_IMAGE>:<prefix>            multi-arch manifest
+#   <DOCKER_IMAGE>:<prefix>-amd64      single arch
+#   <DOCKER_IMAGE>:<prefix>-arm64v8    single arch
+#
+# The image is the all-in-one stack the docker/ context already describes:
+# hbbs + hbbr + key-secret + the rustdesk-api web console under s6-overlay.
+# hbbs here is built from this repository, so it carries the UDP hole-punching
+# and IPv6 (socket_addr_v6) fixes that the published images lack.
+#
+# Required repository secrets:
+#   DOCKER_IMAGE    target repo on Docker Hub, e.g. "yourname/rustdesk-server-s6"
+#   DOCKER_USERNAME Docker Hub username
+#   DOCKER_PASSWORD Docker Hub access token (read/write)
+
+on:
+  workflow_dispatch:
+    inputs:
+      TAG_PREFIX:
+        description: 'Tag prefix, e.g. dualstack -> <image>:dualstack'
+        required: false
+        default: 'dualstack'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dockerhub-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Musl binaries built inside rust:1-alpine: same libc as the runtime image,
+  # and each arch builds on a native runner, so no QEMU and no cross toolchain.
+  build:
+    name: Build binaries - ${{ matrix.job.name }}
+    runs-on: ${{ matrix.job.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64",   runner: "ubuntu-24.04" }
+          - { name: "arm64v8", runner: "ubuntu-24.04-arm" }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build hbbs / hbbr / rustdesk-utils (musl)
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/io" -w /io \
+            rust:1-alpine sh -eu -c '
+              apk add --no-cache git build-base linux-headers pkgconf openssl-dev cmake ca-certificates
+              git config --global --add safe.directory /io
+              cargo build --release
+              chmod -R a+rX target
+            '
+
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          BIN="target/release"
+          cp "$BIN/hbbs" "$BIN/hbbr" "$BIN/rustdesk-utils" dist/
+          ls -la dist
+          sha256sum dist/*
+
+      - name: Publish artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-${{ matrix.job.name }}
+          path: |
+            dist/hbbs
+            dist/hbbr
+            dist/rustdesk-utils
+          if-no-files-found: error
+
+  # Single-arch images: docker/Dockerfile = lejianwen/rustdesk-api base
+  # + s6-overlay + rootfs (our binaries land in rootfs/usr/bin).
+  docker:
+    name: Docker push - ${{ matrix.job.name }}
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64",   docker_platform: "linux/amd64",  s6_platform: "x86_64" }
+          - { name: "arm64v8", docker_platform: "linux/arm64",  s6_platform: "aarch64" }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-linux-${{ matrix.job.name }}
+          path: docker/rootfs/usr/bin
+
+      - name: Make binaries executable
+        run: chmod -v a+x docker/rootfs/usr/bin/*
+
+      - name: Compute tags
+        id: vars
+        run: |
+          PREFIX="${{ github.event.inputs.TAG_PREFIX || 'dualstack' }}"
+          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "PREFIX=$PREFIX" >> $GITHUB_ENV
+          echo "VER=$VER" >> $GITHUB_ENV
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push single-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: "./docker"
+          platforms: ${{ matrix.job.docker_platform }}
+          push: true
+          provenance: false
+          build-args: |
+            S6_ARCH=${{ matrix.job.s6_platform }}
+          tags: |
+            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-${{ matrix.job.name }}
+            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-${{ env.VER }}-${{ matrix.job.name }}
+
+  manifest:
+    name: Docker manifest
+    needs: docker
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute tags
+        id: vars
+        run: |
+          PREFIX="${{ github.event.inputs.TAG_PREFIX || 'dualstack' }}"
+          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "PREFIX=$PREFIX" >> $GITHUB_ENV
+          echo "VER=$VER" >> $GITHUB_ENV
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Create and push manifest (${{ env.PREFIX }})
+        uses: Noelware/docker-manifest-action@v0.2.3
+        with:
+          tags: ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}
+          inputs: |
+            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-amd64,
+            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-arm64v8
+          push: true
+
+      - name: Create and push manifest (${{ env.PREFIX }}-${{ env.VER }})
+        uses: Noelware/docker-manifest-action@v0.2.3
+        with:
+          tags: ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-${{ env.VER }}
+          inputs: |
+            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-${{ env.VER }}-amd64,
+            ${{ secrets.DOCKER_IMAGE }}:${{ env.PREFIX }}-${{ env.VER }}-arm64v8
+          push: true
