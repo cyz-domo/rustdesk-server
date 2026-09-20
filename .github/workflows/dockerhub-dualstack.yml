@@ -1,13 +1,17 @@
 name: Docker Hub - patched all-in-one image
 
 # What this produces
-#   <DOCKER_IMAGE>:<prefix>-amd64 / -arm64v8     single arch
-#   <DOCKER_IMAGE>:<prefix>                       multi-arch manifest
+#   <DOCKER_IMAGE>:<version>-amd64 / -arm64v8     single arch
+#   <DOCKER_IMAGE>:<version>                      multi-arch manifest
+#   <DOCKER_IMAGE>:latest / -amd64 / -arm64v8     only when PUSH_LATEST is on
 #
 # The image is the all-in-one stack docker/Dockerfile already describes:
 # hbbs + hbbr + key-secret + the rustdesk-api web console under s6-overlay.
 # hbbs here is compiled from this repository, so it carries the UDP hole-punching
 # and IPv6 (socket_addr_v6) fixes that the published images lack.
+#
+# Run it from a branch that contains those fixes (ci-dockerhub), NOT from the
+# bare forapi branch: the guard step below aborts if the patch markers are absent.
 #
 # Required repository secrets:
 #   DOCKER_IMAGE    target repo on Docker Hub, e.g. "yourname/rustdesk-server-s6"
@@ -17,10 +21,14 @@ name: Docker Hub - patched all-in-one image
 on:
   workflow_dispatch:
     inputs:
-      TAG_PREFIX:
-        description: 'Tag prefix, e.g. dualstack -> <image>:dualstack'
+      VERSION:
+        description: 'Image version, e.g. 1.1.14-1. Empty = <Cargo.toml version>-dualstack'
         required: false
-        default: 'dualstack'
+        default: ''
+      PUSH_LATEST:
+        description: 'Also move the :latest tag (true/false)'
+        required: false
+        default: 'false'
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,20 +45,24 @@ jobs:
     name: Compute tags
     runs-on: ubuntu-24.04
     outputs:
-      prefix: ${{ steps.vars.outputs.PREFIX }}
-      ver: ${{ steps.vars.outputs.VER }}
+      version: ${{ steps.vars.outputs.VERSION }}
+      push_latest: ${{ steps.vars.outputs.PUSH_LATEST }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Derive prefix and version
+      - name: Derive version
         id: vars
         run: |
-          PREFIX="${{ github.event.inputs.TAG_PREFIX || 'dualstack' }}"
-          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          echo "PREFIX=$PREFIX" >> "$GITHUB_OUTPUT"
-          echo "VER=$VER" >> "$GITHUB_OUTPUT"
-          echo "tags: $PREFIX, $PREFIX-$VER"
+          CARGO_VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          VERSION="${{ github.event.inputs.VERSION }}"
+          [ -n "$VERSION" ] || VERSION="${CARGO_VER}-dualstack"
+          case "$VERSION" in
+            *[!A-Za-z0-9._-]*) echo "invalid VERSION: $VERSION" >&2; exit 1 ;;
+          esac
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "PUSH_LATEST=${{ github.event.inputs.PUSH_LATEST || 'false' }}" >> "$GITHUB_OUTPUT"
+          echo "building $VERSION (latest: ${{ github.event.inputs.PUSH_LATEST || 'false' }})"
 
   # Musl binaries built inside rust:1-alpine: same libc as the runtime image,
   # and each arch builds on a native runner, so no QEMU and no cross toolchain.
@@ -69,6 +81,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # An unpatched build pushed under these tags would be worse than no build.
+      - name: Guard - this ref must carry the hbbs fixes
+        run: |
+          set -eu
+          grep -q 'is_udp: socket.is_some()'              src/rendezvous_server.rs
+          grep -q 'udp_port: ph.udp_port'                 src/rendezvous_server.rs
+          grep -q 'if !ph.socket_addr_v6.is_empty()'      src/rendezvous_server.rs
+          grep -q 'socket_addr_v6: la.socket_addr_v6'     src/rendezvous_server.rs
+          echo "patch markers present"
 
       - name: Build hbbs / hbbr / rustdesk-utils (musl)
         run: |
@@ -111,6 +133,8 @@ jobs:
         job:
           - { name: "amd64",   docker_platform: "linux/amd64", s6_platform: "x86_64" }
           - { name: "arm64v8", docker_platform: "linux/arm64", s6_platform: "aarch64" }
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -146,8 +170,20 @@ jobs:
           build-args: |
             S6_ARCH=${{ matrix.job.s6_platform }}
           tags: |
-            ${{ secrets.DOCKER_IMAGE }}:${{ needs.meta.outputs.prefix }}-${{ matrix.job.name }}
-            ${{ secrets.DOCKER_IMAGE }}:${{ needs.meta.outputs.prefix }}-${{ needs.meta.outputs.ver }}-${{ matrix.job.name }}
+            ${{ secrets.DOCKER_IMAGE }}:${{ env.VERSION }}-${{ matrix.job.name }}
+
+      - name: Build and push :<arch>-latest
+        if: needs.meta.outputs.push_latest == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: "./docker"
+          platforms: ${{ matrix.job.docker_platform }}
+          push: true
+          provenance: false
+          build-args: |
+            S6_ARCH=${{ matrix.job.s6_platform }}
+          tags: |
+            ${{ secrets.DOCKER_IMAGE }}:latest-${{ matrix.job.name }}
 
   manifest:
     name: Docker manifest
@@ -155,8 +191,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       IMAGE: ${{ secrets.DOCKER_IMAGE }}
-      PREFIX: ${{ needs.meta.outputs.prefix }}
-      VER: ${{ needs.meta.outputs.ver }}
+      VERSION: ${{ needs.meta.outputs.version }}
     steps:
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -167,14 +202,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Create and push manifest ($PREFIX-$VER)
+      - name: Create and push manifest (:${{ env.VERSION }})
         run: |
           docker buildx imagetools create \
-            -t "$IMAGE:$PREFIX-$VER" \
-            "$IMAGE:$PREFIX-$VER-amd64" "$IMAGE:$PREFIX-$VER-arm64v8"
+            -t "$IMAGE:$VERSION" \
+            "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64v8"
 
-      - name: Create and push manifest ($PREFIX)
+      - name: Create and push manifest (:latest)
+        if: needs.meta.outputs.push_latest == 'true'
         run: |
           docker buildx imagetools create \
-            -t "$IMAGE:$PREFIX" \
-            "$IMAGE:$PREFIX-amd64" "$IMAGE:$PREFIX-arm64v8"
+            -t "$IMAGE:latest" \
+            "$IMAGE:latest-amd64" "$IMAGE:latest-arm64v8"
