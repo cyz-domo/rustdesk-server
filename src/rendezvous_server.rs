@@ -1401,14 +1401,107 @@ impl RendezvousServer {
         });
     }
 
+    pub async fn parse_proxy_protocol(stream: &mut TcpStream, addr: &mut SocketAddr) {
+        const PPV2_PREFIX: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
+        const PPV1_PREFIX: &[u8; 6] = b"PROXY ";
+
+        let mut peek_buf = [0u8; 16];
+        let start_time = tokio::time::Instant::now();
+        let mut n = 0;
+        while n < 16 {
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            if elapsed >= 300 {
+                break;
+            }
+            let remain = 300 - elapsed;
+            match timeout(remain, stream.peek(&mut peek_buf)).await {
+                Ok(Ok(bytes_read)) if bytes_read > n => {
+                    n = bytes_read;
+                    if n >= 6 && &peek_buf[..6] == PPV1_PREFIX {
+                        break;
+                    }
+                    if n >= 12 && &peek_buf[..12] == PPV2_PREFIX {
+                        break;
+                    }
+                    if !PPV2_PREFIX.starts_with(&peek_buf[..n])
+                        && !PPV1_PREFIX.starts_with(&peek_buf[..n])
+                    {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        if n >= 12 && &peek_buf[..12] == PPV2_PREFIX {
+            let mut fixed_hdr = [0u8; 16];
+            if stream.read_exact(&mut fixed_hdr).await.is_err() {
+                return;
+            }
+            let ver_cmd = fixed_hdr[12];
+            if (ver_cmd & 0xF0) != 0x20 {
+                return;
+            }
+            let cmd = ver_cmd & 0x0F;
+            let fam_proto = fixed_hdr[13];
+            let fam = fam_proto & 0xF0;
+            let proto = fam_proto & 0x0F;
+            let len = u16::from_be_bytes([fixed_hdr[14], fixed_hdr[15]]) as usize;
+            let mut body = vec![0u8; len];
+            if stream.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            if cmd == 0x01 && proto == 0x01 {
+                if fam == 0x10 && len >= 12 {
+                    let src_ip = std::net::Ipv4Addr::new(body[0], body[1], body[2], body[3]);
+                    let src_port = u16::from_be_bytes([body[8], body[9]]);
+                    let real_addr = SocketAddr::V4(std::net::SocketAddrV4::new(src_ip, src_port));
+                    log::info!("ProxyProtocol v2: updated client {} -> {}", addr, real_addr);
+                    *addr = real_addr;
+                } else if fam == 0x20 && len >= 36 {
+                    let mut ip6_bytes = [0u8; 16];
+                    ip6_bytes.copy_from_slice(&body[0..16]);
+                    let src_ip = std::net::Ipv6Addr::from(ip6_bytes);
+                    let src_port = u16::from_be_bytes([body[32], body[33]]);
+                    let real_addr = SocketAddr::V6(std::net::SocketAddrV6::new(src_ip, src_port, 0, 0));
+                    log::info!("ProxyProtocol v2: updated client {} -> {}", addr, real_addr);
+                    *addr = real_addr;
+                }
+            }
+        } else if n >= 6 && &peek_buf[..6] == PPV1_PREFIX {
+            let mut line_bytes = Vec::with_capacity(108);
+            let mut one = [0u8; 1];
+            while line_bytes.len() < 108 {
+                if stream.read_exact(&mut one).await.is_err() {
+                    return;
+                }
+                line_bytes.push(one[0]);
+                if one[0] == b'\n' {
+                    break;
+                }
+            }
+            if let Ok(line_str) = std::str::from_utf8(&line_bytes) {
+                let parts: Vec<&str> = line_str.trim().split_whitespace().collect();
+                if parts.len() >= 6 && (parts[1] == "TCP4" || parts[1] == "TCP6") {
+                    if let (Ok(ip), Ok(port)) = (parts[2].parse::<std::net::IpAddr>(), parts[4].parse::<u16>()) {
+                        let real_addr = SocketAddr::new(ip, port);
+                        log::info!("ProxyProtocol v1: updated client {} -> {}", addr, real_addr);
+                        *addr = real_addr;
+                    }
+                }
+            }
+        }
+    }
+
     #[inline]
     async fn handle_listener_inner(
         &mut self,
-        stream: TcpStream,
+        mut stream: TcpStream,
         mut addr: SocketAddr,
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        Self::parse_proxy_protocol(&mut stream, &mut addr).await;
         let mut sink;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
