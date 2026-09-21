@@ -860,7 +860,7 @@ impl RendezvousServer {
             // B's observed address when it reached us over IPv6.
             socket_addr_v6: if !phs.socket_addr_v6.is_empty() {
                 phs.socket_addr_v6.clone()
-            } else if addr.is_ipv6() {
+            } else if try_into_v4(addr).is_ipv6() {
                 AddrMangle::encode(addr).into()
             } else {
                 Default::default()
@@ -988,24 +988,22 @@ impl RendezvousServer {
                 }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
-            let is_real_public = match addr {
+            let norm_addr = try_into_v4(addr);
+            let norm_peer = try_into_v4(peer_addr);
+            let is_real_public = match norm_addr {
                 SocketAddr::V4(v4) => {
                     let ip = v4.ip();
                     !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
                 }
                 SocketAddr::V6(v6) => {
                     let ip = v6.ip();
-                    !ip.is_loopback() && !ip.is_unspecified()
+                    let seg0 = ip.segments()[0];
+                    !ip.is_loopback() && !ip.is_unspecified() && (seg0 & 0xfe00 != 0xfc00) && (seg0 & 0xffc0 != 0xfe80)
                 }
             };
             let same_intranet: bool = !ws
-                && (peer_is_lan && is_lan || (is_real_public && {
-                    match (peer_addr, addr) {
-                        (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
-                        (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
-                        _ => false,
-                    }
-                }));
+                && (peer_is_lan && is_lan && norm_peer.ip() != norm_addr.ip()
+                    || (is_real_public && norm_peer.ip() == norm_addr.ip()));
             let socket_addr: Bytes = AddrMangle::encode(addr).into();
             // The client only runs the IPv6 leg when the dedicated socket_addr_v6 field carries
             // a port, and it dials exactly that port — so it has to be A's own IPv6 UDP punch
@@ -1016,7 +1014,7 @@ impl RendezvousServer {
             // observed v6 address only when A reached us over v6 but reported no socket.
             let socket_addr_v6 = if !ph.socket_addr_v6.is_empty() {
                 ph.socket_addr_v6
-            } else if addr.is_ipv6() {
+            } else if norm_addr.is_ipv6() {
                 socket_addr.clone()
             } else {
                 Default::default()
