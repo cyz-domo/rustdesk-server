@@ -988,14 +988,24 @@ impl RendezvousServer {
                 }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
+            let is_real_public = match addr {
+                SocketAddr::V4(v4) => {
+                    let ip = v4.ip();
+                    !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
+                }
+                SocketAddr::V6(v6) => {
+                    let ip = v6.ip();
+                    !ip.is_loopback() && !ip.is_unspecified()
+                }
+            };
             let same_intranet: bool = !ws
-                && (peer_is_lan && is_lan || {
+                && (peer_is_lan && is_lan || (is_real_public && {
                     match (peer_addr, addr) {
                         (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
                         (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
                         _ => false,
                     }
-                });
+                }));
             let socket_addr: Bytes = AddrMangle::encode(addr).into();
             // The client only runs the IPv6 leg when the dedicated socket_addr_v6 field carries
             // a port, and it dials exactly that port — so it has to be A's own IPv6 UDP punch
