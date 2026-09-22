@@ -57,6 +57,23 @@ enum Data {
 }
 
 const REG_TIMEOUT: i32 = 30_000;
+// An accepted punch request keeps the right to have its reply relayed for this long. A
+// legitimate reply lands within milliseconds; the window only has to cover the client's
+// punch retries, which re-send the request anyway.
+const PUNCH_TARGET_TTL: Duration = Duration::from_secs(30);
+// Bound on that map so unauthenticated traffic cannot grow it without limit.
+const MAX_PUNCH_TARGETS: usize = 8_192;
+// Replies a single accepted punch request may still have relayed to it. One request spawns at
+// most 3 UDP PunchHoleSent retries, 1 TCP PunchHoleSent and 1 LocalAddr, so a legitimate flow
+// stays well inside this; the cap only stops a target that once asked for a punch from staying
+// a live reflector for the whole TTL.
+const PUNCH_REPLY_GRANTS: u8 = 8;
+
+struct PunchGrant {
+    created: Instant,
+    left: u8,
+}
+
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 struct SafeWsSink {
@@ -127,6 +144,9 @@ pub struct RendezvousServer {
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
     ws_map: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    // Addresses that just completed a punch request and the replies still owed to them, see
+    // note_punch_target.
+    punch_targets: Arc<Mutex<HashMap<SocketAddr, PunchGrant>>>,
 }
 
 enum LoopFailure {
@@ -186,6 +206,7 @@ impl RendezvousServer {
                 secure_tcp_sk_b,
             }),
             ws_map: Arc::new(Mutex::new(HashMap::new())),
+            punch_targets: Arc::new(Mutex::new(HashMap::new())),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -449,21 +470,19 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     self.handle_local_addr(la, addr, Some(socket)).await?;
                 }
-                Some(rendezvous_message::Union::TestNatRequest(tar)) => {
+                Some(rendezvous_message::Union::TestNatRequest(_)) => {
                     // Answer UDP TestNat with the observed source port so clients learn their
                     // UDP mapping; without this PunchHoleRequest.udp_port stays 0 and the
                     // UDP punch path never runs.
+                    // Port only, no ConfigUpdate as on the TCP arm: this reply goes to any
+                    // unauthenticated datagram whose source can be spoofed, and the server
+                    // list is not something to hand out there. Clients' UDP NAT test reads
+                    // only the port; the server list still arrives with the TCP NAT test.
                     let mut msg_out = RendezvousMessage::new();
-                    let mut res = TestNatResponse {
+                    let res = TestNatResponse {
                         port: addr.port() as _,
                         ..Default::default()
                     };
-                    if self.inner.serial > tar.serial {
-                        let mut cu = ConfigUpdate::new();
-                        cu.serial = self.inner.serial;
-                        cu.rendezvous_servers = (*self.rendezvous_servers).clone();
-                        res.cu = MessageField::from_option(Some(cu));
-                    }
                     msg_out.set_test_nat_response(res);
                     socket.send(&msg_out, addr).await?;
                 }
@@ -833,6 +852,61 @@ impl RendezvousServer {
         // socket.send(&msg_out, socket_addr).await
     }
 
+    /// Remember that `addr` completed a punch request, so its punch reply may be relayed.
+    ///
+    /// The reply's destination is payload-chosen (`PunchHoleSent.socket_addr`,
+    /// `LocalAddr.socket_addr`) and used to be sent to whatever address it named, over a
+    /// socket that needs no handshake, with no key check and no rate limit - a UDP
+    /// reflection and amplification vector aimed at any third party. `addr` here is the
+    /// observed source of a request that already passed the licence key / login checks,
+    /// and it is exactly the address this server hands the peer to answer, so a legitimate
+    /// reply still matches. Both sides normalize with try_into_v4: the socket is dual-stack,
+    /// so a v4 peer is observed as ::ffff:a.b.c.d but decodes back as plain v4.
+    ///
+    /// The grant is refilled per request: a peer that punches again asks again, so its budget
+    /// only has to cover the replies of one punch. Expired entries are swept here, but only
+    /// once the map is full, to keep the common path O(1).
+    async fn note_punch_target(&self, addr: SocketAddr) {
+        let addr = try_into_v4(addr);
+        let mut map = self.punch_targets.lock().await;
+        let now = Instant::now();
+        if map.len() >= MAX_PUNCH_TARGETS {
+            map.retain(|_, g| now.duration_since(g.created) < PUNCH_TARGET_TTL);
+            if map.len() >= MAX_PUNCH_TARGETS {
+                return;
+            }
+        }
+        map.insert(
+            addr,
+            PunchGrant {
+                created: now,
+                left: PUNCH_REPLY_GRANTS,
+            },
+        );
+    }
+
+    /// Spend one of the replies `addr` is still owed; false when it is owed none, which is
+    /// also what an exhausted or expired entry answers. Consuming rather than merely checking
+    /// bounds how often one accepted request can be turned into traffic towards its target.
+    async fn take_punch_grant(&self, addr: SocketAddr) -> bool {
+        let addr = try_into_v4(addr);
+        let mut map = self.punch_targets.lock().await;
+        let grant = match map.get_mut(&addr) {
+            Some(g) => g,
+            None => return false,
+        };
+        if grant.created.elapsed() >= PUNCH_TARGET_TTL {
+            map.remove(&addr);
+            return false;
+        }
+        if grant.left <= 1 {
+            map.remove(&addr);
+            return true;
+        }
+        grant.left -= 1;
+        true
+    }
+
     #[inline]
     async fn handle_hole_sent<'a>(
         &mut self,
@@ -842,6 +916,14 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         // punch hole sent from B, tell A that B is ready to be connected
         let addr_a = AddrMangle::decode(&phs.socket_addr);
+        if !self.take_punch_grant(addr_a).await {
+            log::debug!(
+                "drop punch hole response from {:?} to {:?}: no punch request from there",
+                &addr,
+                &addr_a
+            );
+            return Ok(());
+        }
         log::debug!(
             "{} punch hole response to {:?} from {:?}",
             if socket.is_none() { "TCP" } else { "UDP" },
@@ -892,6 +974,14 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         // relay local addrs of B to A
         let addr_a = AddrMangle::decode(&la.socket_addr);
+        if !self.take_punch_grant(addr_a).await {
+            log::debug!(
+                "drop local addr response from {:?} to {:?}: no punch request from there",
+                &addr,
+                &addr_a
+            );
+            return Ok(());
+        }
         log::debug!(
             "{} local addrs response to {:?} from {:?}",
             if socket.is_none() { "TCP" } else { "UDP" },
@@ -1052,7 +1142,9 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             }
-            //
+            // Reached only past the licence key / login checks and only for a peer that is
+            // online: the reply to this punch is relayed back to this address and nowhere else.
+            self.note_punch_target(addr).await;
             Ok((msg_out, Some(peer_addr)))
         } else {
             let mut msg_out = RendezvousMessage::new();
