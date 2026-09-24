@@ -720,7 +720,11 @@ impl RendezvousServer {
         addr: SocketAddr,
         ws: bool,
     ) -> Result<register_pk_response::Result, register_pk_response::Result> {
-        if rk.uuid.is_empty() || rk.pk.is_empty() {
+        let is_change_id = !rk.old_id.is_empty() && rk.old_id != rk.id;
+        if rk.uuid.is_empty() {
+            return Err(INVALID_ID_FORMAT);
+        }
+        if !is_change_id && rk.pk.is_empty() {
             return Err(INVALID_ID_FORMAT);
         }
         let id = rk.id;
@@ -731,6 +735,13 @@ impl RendezvousServer {
         } else if !self.check_ip_blocker(&ip, &id).await {
             return Err(TOO_FREQUENT);
             //return Err(send_rk_res(socket, addr, TOO_FREQUENT).await);
+        }
+        if is_change_id {
+            IP_CHANGES.lock().await.remove(&rk.old_id);
+            return self
+                .pm
+                .change_id(&rk.old_id, &id, &rk.uuid, &rk.pk, addr, ip)
+                .await;
         }
         let peer = self.pm.get_or(&id).await;
         let (changed, ip_changed) = {

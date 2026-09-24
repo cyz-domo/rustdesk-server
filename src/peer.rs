@@ -177,4 +177,60 @@ impl PeerMap {
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
     }
+
+    pub(crate) async fn change_id(
+        &mut self,
+        old_id: &str,
+        new_id: &str,
+        uuid: &Bytes,
+        pk: &Bytes,
+        addr: SocketAddr,
+        ip: String,
+    ) -> Result<register_pk_response::Result, register_pk_response::Result> {
+        if !hbb_common::is_valid_custom_id(new_id) {
+            return Err(register_pk_response::Result::INVALID_ID_FORMAT);
+        }
+        if let Some(target_peer) = self.get(new_id).await {
+            let target_uuid = target_peer.read().await.uuid.clone();
+            if !target_uuid.is_empty() && target_uuid != *uuid {
+                return Err(register_pk_response::Result::ID_EXISTS);
+            }
+        }
+        let mut final_pk = pk.clone();
+        let mut guid = Vec::new();
+        if let Some(old_peer) = self.get(old_id).await {
+            let r = old_peer.read().await;
+            if !r.uuid.is_empty() && r.uuid != *uuid {
+                log::warn!(
+                    "Change ID old_id {} uuid mismatch: {:?} vs {:?}",
+                    old_id,
+                    uuid,
+                    r.uuid
+                );
+                return Err(register_pk_response::Result::UUID_MISMATCH);
+            }
+            if final_pk.is_empty() {
+                final_pk = r.pk.clone();
+            }
+            guid = r.guid.clone();
+        }
+        if final_pk.is_empty() {
+            return Err(register_pk_response::Result::INVALID_ID_FORMAT);
+        }
+
+        self.map.write().await.remove(old_id);
+        let peer = self.get_or(new_id).await;
+        if !guid.is_empty() {
+            peer.write().await.guid = guid;
+        }
+        let res = self
+            .update_pk(new_id.to_string(), peer, addr, uuid.clone(), final_pk, ip)
+            .await;
+        if res == register_pk_response::Result::OK {
+            log::info!("Successfully changed ID from {} to {}", old_id, new_id);
+            Ok(register_pk_response::Result::OK)
+        } else {
+            Err(res)
+        }
+    }
 }
