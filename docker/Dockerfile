@@ -1,5 +1,7 @@
 FROM lejianwen/rustdesk-api:latest
 
+RUN apk add --no-cache sqlite
+
 ARG S6_OVERLAY_VERSION=3.2.0.0
 ARG S6_ARCH=x86_64
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp
