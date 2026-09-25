@@ -12,6 +12,8 @@ RUN \
 
 COPY rootfs /
 
+RUN sed -i -E 's/^(\s*max-open-conns:) 100$/\1 10/' /app/conf/config.yaml
+
 ENV RELAY=relay.example.com
 ENV ENCRYPTED_ONLY=0
 
