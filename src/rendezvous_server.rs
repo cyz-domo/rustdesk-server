@@ -39,6 +39,7 @@ use hbb_common::{
 };
 use ipnetwork::Ipv4Network;
 
+use crate::http_proxy;
 use crate::jwt;
 use std::io::Error;
 use std::{
@@ -111,6 +112,32 @@ impl Sink {
                     allow_err!(s.sink.send(Bytes::from(bytes)).await)
                 }
             }
+        }
+    }
+
+    /// Send already-serialized RendezvousMessage bytes (for unions our pinned proto
+    /// cannot represent, e.g. HttpProxyResponse). Framing and encryption match `send`.
+    async fn send_raw(&mut self, mut bytes: Vec<u8>) {
+        match self {
+            Sink::Wss(s) => {
+                if let Some(key) = s.encrypt.as_mut() {
+                    bytes = key.enc(&bytes);
+                }
+                allow_err!(s.sink.send(tungstenite::Message::Binary(bytes)).await)
+            }
+            Sink::Tss(s) => {
+                if let Some(key) = s.encrypt.as_mut() {
+                    bytes = key.enc(&bytes);
+                }
+                allow_err!(s.sink.send(Bytes::from(bytes)).await)
+            }
+        }
+    }
+
+    fn encrypted(&self) -> bool {
+        match self {
+            Sink::Wss(s) => s.encrypt.is_some(),
+            Sink::Tss(s) => s.encrypt.is_some(),
         }
     }
 }
@@ -692,7 +719,20 @@ impl RendezvousServer {
                     });
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                _ => {}
+                _ => {
+                    // HttpProxyRequest is union field 27, absent from our pinned proto, so it
+                    // parses to `union: None`. Only serve it on encrypted TCP connections that
+                    // finished the key exchange; the ws sink never decrypts inbound frames.
+                    if let Some(sink) = sink.as_mut() {
+                        if !ws && sink.encrypted() {
+                            if let Some(req) = http_proxy::parse_request_frame(bytes) {
+                                let resp = http_proxy::forward(req).await;
+                                sink.send_raw(http_proxy::encode_response_frame(&resp)).await;
+                                return true;
+                            }
+                        }
+                    }
+                }
             }
         }
         false
